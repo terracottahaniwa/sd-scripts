@@ -1,6 +1,9 @@
 import math
 import argparse
+import itertools
+import json
 import os
+import re
 import time
 import torch
 from safetensors.torch import load_file, save_file
@@ -16,6 +19,106 @@ import logging
 
 logger = logging.getLogger(__name__)
 import concurrent.futures
+
+ACCEPTABLE = [12, 17, 20, 26]
+SDXL_LAYER_NUM = [12, 20]
+
+LAYER12 = {
+    "BASE": True,
+    "IN00": False, "IN01": False, "IN02": False, "IN03": False, "IN04": True, "IN05": True,
+    "IN06": False, "IN07": True, "IN08": True, "IN09": False, "IN10": False, "IN11": False,
+    "MID": True,
+    "OUT00": True, "OUT01": True, "OUT02": True, "OUT03": True, "OUT04": True, "OUT05": True,
+    "OUT06": False, "OUT07": False, "OUT08": False, "OUT09": False, "OUT10": False, "OUT11": False
+}
+
+LAYER17 = {
+    "BASE": True,
+    "IN00": False, "IN01": True, "IN02": True, "IN03": False, "IN04": True, "IN05": True,
+    "IN06": False, "IN07": True, "IN08": True, "IN09": False, "IN10": False, "IN11": False,
+    "MID": True,
+    "OUT00": False, "OUT01": False, "OUT02": False, "OUT03": True, "OUT04": True, "OUT05": True,
+    "OUT06": True, "OUT07": True, "OUT08": True, "OUT09": True, "OUT10": True, "OUT11": True,
+}
+
+LAYER20 = {
+    "BASE": True,
+    "IN00": True, "IN01": True, "IN02": True, "IN03": True, "IN04": True, "IN05": True,
+    "IN06": True, "IN07": True, "IN08": True, "IN09": False, "IN10": False, "IN11": False,
+    "MID": True,
+    "OUT00": True, "OUT01": True, "OUT02": True, "OUT03": True, "OUT04": True, "OUT05": True,
+    "OUT06": True, "OUT07": True, "OUT08": True, "OUT09": False, "OUT10": False, "OUT11": False,
+}
+
+LAYER26 = {
+    "BASE": True,
+    "IN00": True, "IN01": True, "IN02": True, "IN03": True, "IN04": True, "IN05": True,
+    "IN06": True, "IN07": True, "IN08": True, "IN09": True, "IN10": True, "IN11": True,
+    "MID": True,
+    "OUT00": True, "OUT01": True, "OUT02": True, "OUT03": True, "OUT04": True, "OUT05": True,
+    "OUT06": True, "OUT07": True, "OUT08": True, "OUT09": True, "OUT10": True, "OUT11": True,
+}
+
+assert len([v for v in LAYER12.values() if v]) == 12
+assert len([v for v in LAYER17.values() if v]) == 17
+assert len([v for v in LAYER20.values() if v]) == 20
+assert len([v for v in LAYER26.values() if v]) == 26
+
+RE_UPDOWN = re.compile(r"(up|down)_blocks_(\d+)_(resnets|upsamplers|downsamplers|attentions)_(\d+)_")
+
+
+def get_lbw_block_index(lora_name: str, is_sdxl: bool = False) -> int:
+    # lbw block index is 0-based, but 0 for text encoder, so we return 0 for text encoder
+    if "text_model_encoder_" in lora_name:  # LoRA for text encoder
+        return 0
+
+    # lbw block index is 1-based for U-Net, and no "input_blocks.0" in CompVis SD, so "input_blocks.1" have index 2
+    block_idx = -1  # invalid lora name
+    if not is_sdxl:
+        NUM_OF_BLOCKS = 12  # up/down blocks
+        m = RE_UPDOWN.search(lora_name)
+        if m:
+            g = m.groups()
+            up_down = g[0]
+            i = int(g[1])
+            j = int(g[3])
+            if up_down == "down":
+                if g[2] == "resnets" or g[2] == "attentions":
+                    idx = 3 * i + j + 1
+                elif g[2] == "downsamplers":
+                    idx = 3 * (i + 1)
+                else:
+                    return block_idx  # invalid lora name
+            elif up_down == "up":
+                if g[2] == "resnets" or g[2] == "attentions":
+                    idx = 3 * i + j
+                elif g[2] == "upsamplers":
+                    idx = 3 * i + 2
+                else:
+                    return block_idx  # invalid lora name
+
+            if g[0] == "down":
+                block_idx = 1 + idx  # 1-based index, down block index
+            elif g[0] == "up":
+                block_idx = 1 + NUM_OF_BLOCKS + 1 + idx  # 1-based index, num blocks, mid block, up block index
+
+        elif "mid_block_" in lora_name:
+            block_idx = 1 + NUM_OF_BLOCKS  # 1-based index, num blocks, mid block
+    else:
+        if lora_name.startswith("lora_unet_"):
+            name = lora_name[len("lora_unet_") :]
+            if name.startswith("time_embed_") or name.startswith("label_emb_"):  # 1, No LoRA in sd-scripts
+                block_idx = 1
+            elif name.startswith("input_blocks_"):  # 1-8 to 2-9
+                block_idx = 1 + int(name.split("_")[2])
+            elif name.startswith("middle_block_"):  # 10
+                block_idx = 10
+            elif name.startswith("output_blocks_"):  # 0-8 to 11-19
+                block_idx = 11 + int(name.split("_")[2])
+            elif name.startswith("out_"):  # 20, No LoRA in sd-scripts
+                block_idx = 20
+
+    return block_idx
 
 
 def load_state_dict(file_name, dtype):
@@ -55,7 +158,7 @@ def detect_method_from_training_model(models, dtype):
                 return "OFT"
 
 
-def merge_to_sd_model(text_encoder1, text_encoder2, unet, models, ratios, merge_dtype):
+def merge_to_sd_model(text_encoder1, text_encoder2, unet, models, ratios, lbws, merge_dtype):
     text_encoder1.to(merge_dtype)
     text_encoder1.to(merge_dtype)
     unet.to(merge_dtype)
@@ -94,13 +197,43 @@ def merge_to_sd_model(text_encoder1, text_encoder2, unet, models, ratios, merge_
                         lora_name = lora_name.replace(".", "_")
                         name_to_module[lora_name] = child_module
 
-    for model, ratio in zip(models, ratios):
+    if lbws and (method == "LoRA"):
+        try:
+            # lbwは"[1,1,1,1,1,1,1,1,1,1,1,1]"のような文字列で与えられることを期待している
+            lbws = [json.loads(lbw) for lbw in lbws]
+        except Exception:
+            raise ValueError(f"format of lbws are must be json / 層別適用率はJSON形式で書いてください")
+        assert all(isinstance(lbw, list) for lbw in lbws), f"lbws are must be list / 層別適用率はリストにしてください"
+        assert len(set(len(lbw) for lbw in lbws)) == 1, "all lbws should have the same length  / 層別適用率は同じ長さにしてください"
+        assert all(len(lbw) in ACCEPTABLE for lbw in lbws), f"length of lbw are must be in {ACCEPTABLE} / 層別適用率の長さは{ACCEPTABLE}のいずれかにしてください"
+        assert all(all(isinstance(weight, (int, float)) for weight in lbw) for lbw in lbws), f"values of lbs are must be numbers / 層別適用率の値はすべて数値にしてください"
+
+        layer_num = len(lbws[0])
+        is_sdxl = True if layer_num in SDXL_LAYER_NUM else False
+        FLAGS = {
+            "12": LAYER12.values(),
+            "17": LAYER17.values(),
+            "20": LAYER20.values(),
+            "26": LAYER26.values(),
+        }[str(layer_num)]
+        LBW_TARGET_IDX = [i for i, flag in enumerate(FLAGS) if flag]
+
+    if lbws and (method == "OFT"):
+        raise NotImplementedError(f"OFT does not support LBW. / OFTではLBWはサポートされていません")
+
+    for model, ratio, lbw in itertools.zip_longest(models, ratios, lbws):
         logger.info(f"loading: {model}")
         lora_sd, _ = load_state_dict(model, merge_dtype)
 
         logger.info(f"merging...")
 
         if method == "LoRA":
+            if lbw:
+                lbw_weights = [1] * 26
+                for index, value in zip(LBW_TARGET_IDX, lbw):
+                    lbw_weights[index] = value
+                print(dict(zip(LAYER26.keys(), lbw_weights)))
+
             for key in tqdm(lora_sd.keys()):
                 if "lora_down" in key:
                     up_key = key.replace("lora_down", "lora_up")
@@ -120,6 +253,12 @@ def merge_to_sd_model(text_encoder1, text_encoder2, unet, models, ratios, merge_
                     dim = down_weight.size()[0]
                     alpha = lora_sd.get(alpha_key, dim)
                     scale = alpha / dim
+
+                    if lbw:
+                        index = get_lbw_block_index(key, is_sdxl)
+                        is_lbw_target = index in LBW_TARGET_IDX
+                        if is_lbw_target:
+                            scale *= lbw_weights[index]  # keyがlbwの対象であれば、lbwの重みを掛ける
 
                     # W <- W + U * D
                     weight = module.weight
@@ -220,7 +359,29 @@ def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
     merged_sd = {}
     v2 = None
     base_model = None
-    for model, ratio in zip(models, ratios):
+
+    if lbws:
+        try:
+            # lbwは"[1,1,1,1,1,1,1,1,1,1,1,1]"のような文字列で与えられることを期待している
+            lbws = [json.loads(lbw) for lbw in lbws]
+        except Exception:
+            raise ValueError(f"format of lbws are must be json / 層別適用率はJSON形式で書いてください")
+        assert all(isinstance(lbw, list) for lbw in lbws), f"lbws are must be list / 層別適用率はリストにしてください"
+        assert len(set(len(lbw) for lbw in lbws)) == 1, "all lbws should have the same length  / 層別適用率は同じ長さにしてください"
+        assert all(len(lbw) in ACCEPTABLE for lbw in lbws), f"length of lbw are must be in {ACCEPTABLE} / 層別適用率の長さは{ACCEPTABLE}のいずれかにしてください"
+        assert all(all(isinstance(weight, (int, float)) for weight in lbw) for lbw in lbws), f"values of lbs are must be numbers / 層別適用率の値はすべて数値にしてください"
+
+        layer_num = len(lbws[0])
+        is_sdxl = True if layer_num in SDXL_LAYER_NUM else False
+        FLAGS = {
+            "12": LAYER12.values(),
+            "17": LAYER17.values(),
+            "20": LAYER20.values(),
+            "26": LAYER26.values(),
+        }[str(layer_num)]
+        LBW_TARGET_IDX = [i for i, flag in enumerate(FLAGS) if flag]
+
+    for model, ratio, lbw in itertools.zip_longest(models, ratios, lbws):
         logger.info(f"loading: {model}")
         lora_sd, lora_metadata = load_state_dict(model, merge_dtype)
 
@@ -229,6 +390,12 @@ def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
                 v2 = lora_metadata.get(train_util.SS_METADATA_KEY_V2, None)  # returns string, SDXLはv2がないのでFalseのはず
             if base_model is None:
                 base_model = lora_metadata.get(train_util.SS_METADATA_KEY_BASE_MODEL_VERSION, None)
+
+        if lbw:
+            lbw_weights = [1] * 26
+            for index, value in zip(LBW_TARGET_IDX, lbw):
+                lbw_weights[index] = value
+            print(dict(zip(LAYER26.keys(), lbw_weights)))
 
         # get alpha and dim
         alphas = {}  # alpha for current model
@@ -275,7 +442,13 @@ def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
             alpha = alphas[lora_module_name]
 
             scale = math.sqrt(alpha / base_alpha) * ratio
-            scale = abs(scale) if "lora_up" in key else scale  # マイナスの重みに対応する。
+            scale = abs(scale) if "lora_up" in key else scale # マイナスの重みに対応する。
+
+            if lbw:
+                index = get_lbw_block_index(key, is_sdxl)
+                is_lbw_target = index in LBW_TARGET_IDX
+                if is_lbw_target:
+                    scale *= lbw_weights[index]  # keyがlbwの対象であれば、lbwの重みを掛ける
 
             if key in merged_sd:
                 assert (
@@ -326,9 +499,13 @@ def merge_lora_models(models, ratios, merge_dtype, concat=False, shuffle=False):
 
 
 def merge(args):
-    assert len(args.models) == len(
-        args.ratios
+    assert (len(args.models) == len(args.ratios)
     ), f"number of models must be equal to number of ratios / モデルの数と重みの数は合わせてください"
+    if args.lbws:
+        assert (len(args.models) == len(args.lbws)
+        ), f"number of models must be equal to number of ratios / モデルの数と層別適用率の数は合わせてください"
+    else:
+        args.lbws = []  # zip_longestで扱えるようにlbws未使用時には空のリストにしておく
 
     def str_to_dtype(p):
         if p == "float":
@@ -356,7 +533,7 @@ def merge(args):
             ckpt_info,
         ) = sdxl_model_util.load_models_from_sdxl_checkpoint(sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, args.sd_model, "cpu")
 
-        merge_to_sd_model(text_model1, text_model2, unet, args.models, args.ratios, merge_dtype)
+        merge_to_sd_model(text_model1, text_model2, unet, args.models, args.ratios, args.lbws, merge_dtype)
 
         if args.no_metadata:
             sai_metadata = None
@@ -372,7 +549,7 @@ def merge(args):
             args.save_to, text_model1, text_model2, unet, 0, 0, ckpt_info, vae, logit_scale, sai_metadata, save_dtype
         )
     else:
-        state_dict, metadata = merge_lora_models(args.models, args.ratios, merge_dtype, args.concat, args.shuffle)
+        state_dict, metadata = merge_lora_models(args.models, args.ratios, args.lbws, merge_dtype, args.concat, args.shuffle)
 
         logger.info(f"calculating hashes and creating metadata...")
 
@@ -427,6 +604,7 @@ def setup_parser() -> argparse.ArgumentParser:
         help="LoRA models to merge: ckpt or safetensors file / マージするLoRAモデル、ckptまたはsafetensors",
     )
     parser.add_argument("--ratios", type=float, nargs="*", help="ratios for each model / それぞれのLoRAモデルの比率")
+    parser.add_argument("--lbws", type=str, nargs="*", help="lbw for each model / それぞれのLoRAモデルの層別適用率")
     parser.add_argument(
         "--no_metadata",
         action="store_true",
